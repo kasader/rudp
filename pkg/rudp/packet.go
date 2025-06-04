@@ -31,6 +31,8 @@ var (
 	FIN = PacketType(0x6)
 )
 
+var ErrTruncatedPacket = errors.New("packet truncated")
+
 // String implements the Stringer interface for printing [PacketType] values.
 func (p PacketType) String() string {
 	switch p {
@@ -77,7 +79,7 @@ func (d Datagram) MarshalBinary() ([]byte, error) {
 // It returns an error if the slice is too short to contain the header.
 func UnmarshalDatagram(pkt []byte) (Datagram, error) {
 	if len(pkt) < headerSize {
-		return Datagram{}, errors.New("udp: packet truncated")
+		return Datagram{}, ErrTruncatedPacket
 	}
 
 	d := Datagram{
