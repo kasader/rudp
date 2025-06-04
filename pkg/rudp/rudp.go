@@ -1,6 +1,6 @@
 package rudp
 
-import "net"
+// import "net"
 
 // https://github.com/ms-s/rudp
 // https://github.com/CBenoit/RUDP
@@ -79,24 +79,22 @@ type address struct {
 type server struct{}
 type client struct{}
 
-func connect() error {
+// func connect() error {
 
-	// Resolve server address once
-	serverAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return err
-	}
+// 	// Resolve server address once
+// 	serverAddr, err := net.ResolveUDPAddr("udp", addr)
+// 	if err != nil {
+// 		return err
+// 	}
 
-	// Bind to local UDP socket on any interface, ephemeral port...
-	// NOTE: By giving :0 to port we are automatically selecting next open port
-	// TODO: Dynamically decide address family (and support dual mode)
-	localAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
-	conn, err := net.ListenUDP("udp", localAddr)
-	if err != nil {
-		logger.Error("[%s] Failed to start client connection: %v", s.ID(), err)
-		s.connCancel()
-		return err
-	}
-	s.packetConn = conn
+// 	localAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+// 	conn, err := net.ListenUDP("udp", localAddr)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// }
+
+func main() {
 
 }
