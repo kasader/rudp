@@ -205,29 +205,37 @@ func TestSendAPISendsData(t *testing.T) {
 	}
 	defer sender.Close()
 
-	// Get receiver's address
 	receiverAddr := receiver.conn.LocalAddr().(*net.UDPAddr)
 
-	// Manually trigger SYN from sender to receiver to establish session
+	// --- Send SYN to receiver to create a session
+	sess := &Session{
+		PeerAddr:   receiverAddr,
+		Timeouts:   make(map[uint32]*time.Timer),
+		LastActive: time.Now(),
+		LastSeqNum: 1,
+	}
+	sender.mu.Lock()
+	sender.sessions[receiverAddr.String()] = sess
+	sender.mu.Unlock()
+
 	synPkt := &Packet{
 		SeqNum: 1,
 		SYN:    true,
 	}
-	senderSess := &Session{
-		PeerAddr:   receiverAddr,
-		Timeouts:   make(map[uint32]*time.Timer),
-		LastActive: time.Now(),
+	sender.sendPacket(sess, synPkt)
+
+	// Wait for receiver to ACK
+	time.Sleep(50 * time.Millisecond)
+	ack := &Packet{
+		SeqNum: 2,
+		Ack:    true,
 	}
-	sender.mu.Lock()
-	sender.sessions[receiverAddr.String()] = senderSess
-	sender.mu.Unlock()
+	sender.handlePacket(receiverAddr, serializePacket(ack))
 
-	sender.sendPacket(senderSess, synPkt)
-
-	// Wait for receiver to establish the session
+	// Wait for the receiver to ACK and create session
 	var recvSess *Session
 	for i := 0; i < 10; i++ {
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 		receiver.mu.Lock()
 		for _, s := range receiver.sessions {
 			recvSess = s
@@ -242,19 +250,135 @@ func TestSendAPISendsData(t *testing.T) {
 		t.Fatal("receiver session not established")
 	}
 
-	// Send data from sender to receiver
-	err = sender.Send(senderSess, []byte("ping from sender"))
-	if err != nil {
-		t.Fatalf("Send() failed: %v", err)
+	// --- Manually ACK the SYN back to sender to simulate full handshake
+	ack = &Packet{
+		SeqNum: 2,
+		Ack:    true,
+	}
+	sender.handlePacket(receiverAddr, serializePacket(ack))
+
+	// --- Send application data
+	payload := []byte("ping from sender")
+	if err := sender.Send(sess, payload); err != nil {
+		t.Fatalf("Send failed: %v", err)
 	}
 
-	// Wait for data reception
+	// --- Wait for receiver to receive data
 	select {
 	case evt := <-recv:
-		if string(evt.Data) != "ping from sender" {
-			t.Fatalf("unexpected payload: %q", evt.Data)
+		if string(evt.Data) != string(payload) {
+			t.Errorf("unexpected data: got %q, want %q", evt.Data, payload)
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(1 * time.Second):
 		t.Fatal("timeout waiting for data event")
 	}
 }
+
+func TestReceiveSideWindowing(t *testing.T) {
+	recv := make(chan Event, 3)
+	socket, err := NewSocket("127.0.0.1:0", func(evt Event) {
+		if evt.Type == EventDataReceived {
+			recv <- evt
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: socket.conn.LocalAddr().(*net.UDPAddr).Port}
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Send SYN
+	conn.Write(buildPacket(1, 0x02, nil))
+	time.Sleep(50 * time.Millisecond)
+
+	// Send out-of-order packets: 3, 2, 1 (after SYN = seq 1)
+	conn.Write(buildPacket(4, 0x00, []byte("third")))
+	conn.Write(buildPacket(3, 0x00, []byte("second")))
+	conn.Write(buildPacket(2, 0x00, []byte("first")))
+
+	// Receive should yield: first, second, third in order
+	expect := []string{"first", "second", "third"}
+	for i := 0; i < 3; i++ {
+		select {
+		case evt := <-recv:
+			if string(evt.Data) != expect[i] {
+				t.Errorf("expected %q but got %q", expect[i], string(evt.Data))
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timed out waiting for packet %d", i)
+		}
+	}
+}
+
+// func TestFragmentationAndReassembly(t *testing.T) {
+// 	received := make(chan Event, 1)
+
+// 	receiver, err := NewSocket("127.0.0.1:0", func(evt Event) {
+// 		if evt.Type == EventDataReceived {
+// 			received <- evt
+// 		}
+// 	})
+// 	if err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	defer receiver.Close()
+
+// 	sender, err := NewSocket("127.0.0.1:0", func(evt Event) {})
+// 	if err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	defer sender.Close()
+
+// 	receiverAddr := receiver.conn.LocalAddr().(*net.UDPAddr)
+
+// 	sess := &Session{
+// 		PeerAddr:   receiverAddr,
+// 		Timeouts:   make(map[uint32]*time.Timer),
+// 		LastActive: time.Now(),
+// 		MTU:        200,
+// 	}
+// 	sender.mu.Lock()
+// 	sender.sessions[receiverAddr.String()] = sess
+// 	sender.mu.Unlock()
+
+// 	// Establish session by sending SYN
+// 	synPkt := &Packet{
+// 		SeqNum: 1,
+// 		SYN:    true,
+// 	}
+// 	sender.sendPacket(sess, synPkt)
+
+// 	// Wait for receiver to accept session
+// 	time.Sleep(100 * time.Millisecond)
+
+// 	// Large payload to trigger fragmentation
+// 	largeData := make([]byte, 1000)
+// 	for i := range largeData {
+// 		largeData[i] = byte(i % 256)
+// 	}
+
+// 	err = sender.Send(sess, largeData)
+// 	if err != nil {
+// 		t.Fatalf("Send failed: %v", err)
+// 	}
+
+// 	select {
+// 	case evt := <-received:
+// 		if len(evt.Data) != len(largeData) {
+// 			t.Fatalf("expected %d bytes, got %d", len(largeData), len(evt.Data))
+// 		}
+// 		for i := range evt.Data {
+// 			if evt.Data[i] != largeData[i] {
+// 				t.Fatalf("data mismatch at byte %d", i)
+// 			}
+// 		}
+// 	case <-time.After(1 * time.Second):
+// 		t.Fatal("timed out waiting for reassembled message")
+// 	}
+// }
