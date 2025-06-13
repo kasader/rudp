@@ -21,6 +21,7 @@ const (
 	EventDataReceived = "RUDP_EVENT_DATA"
 	EventTimeout      = "RUDP_EVENT_TIMEOUT"
 	EventClose        = "RUDP_EVENT_CLOSE"
+	EventCreate       = "RUDP_EVENT_CREATE"
 )
 
 // ErrMalformedPacket is returned when an incoming packet fails parsing (e.g., too short).
@@ -88,7 +89,9 @@ func NewSocket(addr string, handler EventHandler) (*Socket, error) {
 	if err != nil {
 		return nil, err
 	}
-
+	if handler == nil {
+		handler = func(event Event) {}
+	}
 	sock := &Socket{
 		conn:         conn,
 		sessions:     make(map[string]*Session),
@@ -130,6 +133,78 @@ func (s *Socket) Send(sess *Session, data []byte) error {
 	return nil
 }
 
+func (s *Socket) Dial(addr string) (*Session, error) {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	sess := &Session{
+		PeerAddr:    udpAddr,
+		Timeouts:    make(map[uint32]*time.Timer),
+		LastActive:  time.Now(),
+		RecvBuffer:  make(map[uint32]*Packet),
+		ExpectedSeq: 1,
+	}
+
+	s.mu.Lock()
+	s.sessions[udpAddr.String()] = sess
+	s.mu.Unlock()
+
+	s.sendSYN(sess)
+
+	return sess, nil
+}
+
+// SendTo sends data to the given remote address, establishing a session if needed.
+func (s *Socket) SendTo(addr string, data []byte) error {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return err
+	}
+
+	key := udpAddr.String()
+
+	s.mu.Lock()
+	sess, exists := s.sessions[key]
+	if !exists {
+		sess = &Session{
+			PeerAddr:    udpAddr,
+			Timeouts:    make(map[uint32]*time.Timer),
+			LastActive:  time.Now(),
+			RecvBuffer:  make(map[uint32]*Packet),
+			ExpectedSeq: 1,
+		}
+		s.sessions[key] = sess
+		s.mu.Unlock()
+
+		// Initiate handshake outside lock
+		if err := s.sendSYN(sess); err != nil {
+			return err
+		}
+
+		// Optional: wait briefly for handshake (or ACK)
+		time.Sleep(20 * time.Millisecond)
+	} else {
+		s.mu.Unlock()
+	}
+
+	return s.Send(sess, data)
+}
+
+func (s *Socket) sendSYN(sess *Session) error {
+	// create a syn packet for the first communiaction.
+	syn := &Packet{
+		SeqNum:  1,
+		SYN:     true,
+		Retrans: 0,
+	}
+	// reset our last sequence number back to 1
+	sess.LastSeqNum = 1
+	s.sendPacket(sess, syn)
+	return nil
+}
+
 func (s *Socket) listen() {
 	buf := make([]byte, 2048)
 	for {
@@ -163,6 +238,7 @@ func (s *Socket) handlePacket(addr *net.UDPAddr, data []byte) {
 			RecvBuffer:  make(map[uint32]*Packet),
 		}
 		s.sessions[sessionKey] = sess
+		s.eventHandler(Event{Type: EventCreate, Session: sess})
 	}
 	s.mu.Unlock()
 
