@@ -9,8 +9,11 @@ import (
 )
 
 var (
-	RUDP_WINDOW      = 5
-	RUDP_TIMEOUT     = 500 * time.Millisecond
+	// RUDP_WINDOW is a sliding window size for in-flight unacknowledged packets.
+	RUDP_WINDOW = 5
+	// RUDP_TIMEOUT is the timeout duration for packet retransmission.
+	RUDP_TIMEOUT = 500 * time.Millisecond
+	// RUDP_MAX_RETRANS is the max number of retransmission attempts before giving up.
 	RUDP_MAX_RETRANS = 5
 )
 
@@ -20,48 +23,54 @@ const (
 	EventClose        = "RUDP_EVENT_CLOSE"
 )
 
+// ErrMalformedPacket is returned when an incoming packet fails parsing (e.g., too short).
 var ErrMalformedPacket = errors.New("malformed packet received")
 
+// EventType represents an event type such as RUDP_EVENT_DATA.
 type EventType string
 
+// Event encapsulates an event, the session it belongs to, and optional payload.
 type Event struct {
 	Type    EventType
 	Session *Session
 	Data    []byte
 }
 
+// EventHandler is a callback for handling asynchronous events (e.g., incoming data, timeout).
 type EventHandler func(event Event)
 
+// Address represents an endpoint IP/port pair. TODO: (Currently unused in core logic—potential for extension).
 type Address struct {
 	IP   net.IP
 	Port int
 }
 
 type Packet struct {
-	SeqNum  uint32
-	Ack     bool
-	SYN     bool
-	FIN     bool
-	Data    []byte
-	Retrans int
+	SeqNum  uint32 // Packet sequence number.
+	ACK     bool   // ACK flag (packet acknowledged).
+	SYN     bool   // SYN flag (connection open).
+	FIN     bool   // FIN flag (connection close).
+	Data    []byte // Application payload.
+	Retrans int    // Number of retransmissions so far.
 }
 
 type Session struct {
-	PeerAddr   *net.UDPAddr
-	LastSeqNum uint32
-	SendWindow []*Packet
-	SendQueue  []*Packet
-	AckedUntil uint32
-	Timeouts   map[uint32]*time.Timer
+	PeerAddr   *net.UDPAddr           // Remote address.
+	LastSeqNum uint32                 // Last used sequence number.
+	SendWindow []*Packet              // In-flight, unacknowledged packets.
+	SendQueue  []*Packet              // TODO: Unused.
+	AckedUntil uint32                 // Last acknowledged sequence number.
+	Timeouts   map[uint32]*time.Timer // Buffer of retransmission timers by sequence number.
 	LastActive time.Time
 	Closed     bool
 	mu         sync.Mutex
 
 	// fields for receive-side windowing
 	ExpectedSeq uint32             // next expected sequence number
-	RecvBuffer  map[uint32]*Packet // buffer for out-of-order packets
+	RecvBuffer  map[uint32]*Packet // Buffer for out-of-order packets.
 }
 
+// Socket manages UDP transport, session demultiplexing, and event delivery.
 type Socket struct {
 	conn         *net.UDPConn
 	sessions     map[string]*Session
@@ -69,6 +78,7 @@ type Socket struct {
 	mu           sync.Mutex
 }
 
+// NewSocket initializes and binds a RUDP socket to addr with an event callback. Starts background listener.
 func NewSocket(addr string, handler EventHandler) (*Socket, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -161,7 +171,7 @@ func (s *Socket) handlePacket(addr *net.UDPAddr, data []byte) {
 	sess.LastActive = time.Now()
 
 	// Handle ACK
-	if packet.Ack {
+	if packet.ACK {
 		if timer, ok := sess.Timeouts[packet.SeqNum-1]; ok {
 			timer.Stop()
 			delete(sess.Timeouts, packet.SeqNum-1)
@@ -212,7 +222,7 @@ func parsePacket(data []byte) (*Packet, error) {
 
 	return &Packet{
 		SeqNum: seqNum,
-		Ack:    flags&0x01 != 0,
+		ACK:    flags&0x01 != 0,
 		SYN:    flags&0x02 != 0,
 		FIN:    flags&0x04 != 0,
 		Data:   payload,
@@ -222,10 +232,11 @@ func parsePacket(data []byte) (*Packet, error) {
 func ackPacket(seq uint32) *Packet {
 	return &Packet{
 		SeqNum: seq,
-		Ack:    true,
+		ACK:    true,
 	}
 }
 
+// Close shuts down socket and notifies all sessions of closure.
 func (s *Socket) Close() {
 	s.conn.Close()
 	s.mu.Lock()
@@ -247,7 +258,7 @@ func (s *Socket) sendPacket(sess *Session, pkt *Packet) {
 	}
 
 	// Track in SendWindow if not an ACK
-	if !pkt.Ack {
+	if !pkt.ACK {
 		sess.SendWindow = append(sess.SendWindow, pkt)
 
 		if pkt.Retrans >= RUDP_MAX_RETRANS {
@@ -281,7 +292,7 @@ func (s *Socket) sendPacket(sess *Session, pkt *Packet) {
 
 func serializePacket(pkt *Packet) []byte {
 	flags := byte(0)
-	if pkt.Ack {
+	if pkt.ACK {
 		flags |= 0x01
 	}
 	if pkt.SYN {

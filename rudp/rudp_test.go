@@ -21,7 +21,7 @@ func TestParsePacket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if pkt.SeqNum != 42 || !pkt.SYN || !pkt.Ack || pkt.FIN {
+	if pkt.SeqNum != 42 || !pkt.SYN || !pkt.ACK || pkt.FIN {
 		t.Errorf("parsed packet mismatch: %+v", pkt)
 	}
 	if string(pkt.Data) != "hi" {
@@ -228,7 +228,7 @@ func TestSendAPISendsData(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	ack := &Packet{
 		SeqNum: 2,
-		Ack:    true,
+		ACK:    true,
 	}
 	sender.handlePacket(receiverAddr, serializePacket(ack))
 
@@ -253,7 +253,7 @@ func TestSendAPISendsData(t *testing.T) {
 	// --- Manually ACK the SYN back to sender to simulate full handshake
 	ack = &Packet{
 		SeqNum: 2,
-		Ack:    true,
+		ACK:    true,
 	}
 	sender.handlePacket(receiverAddr, serializePacket(ack))
 
