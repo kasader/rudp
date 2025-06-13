@@ -29,118 +29,82 @@ func TestParsePacket(t *testing.T) {
 	}
 }
 
-func TestHandleSYNCreatesSession(t *testing.T) {
-	events := make(chan Event, 1)
-
-	// Use non-blocking send to avoid deadlock on Close()
-	socket, err := NewSocket("127.0.0.1:0", func(evt Event) {
-		select {
-		case events <- evt:
-		default:
-			// Prevent blocking if no one is reading
+func TestHandleEventCreate(t *testing.T) {
+	// Start a RUDP server socket
+	var createdCh = make(chan struct{})
+	server, err := NewSocket("127.0.0.1:0", func(event Event) {
+		if event.Type == EventCreate {
+			createdCh <- struct{}{}
 		}
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer socket.Close()
+	defer server.Close()
 
-	// Prepare UDP connection to the test socket
-	addr := &net.UDPAddr{
-		IP:   net.ParseIP("127.0.0.1"),
-		Port: socket.conn.LocalAddr().(*net.UDPAddr).Port,
-	}
-	conn, err := net.DialUDP("udp", nil, addr)
+	// Start a RUDP client and Dial the server
+	client, err := NewSocket("127.0.0.1:0", nil)
 	if err != nil {
-		t.Fatalf("failed to dial test socket: %v", err)
+		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer client.Close()
 
-	// Send SYN packet to initiate session
-	seq := uint32(100)
-	synPacket := buildPacket(seq, 0x02, nil) // 0x02 = SYN
-	if _, err := conn.Write(synPacket); err != nil {
-		t.Fatalf("failed to send SYN: %v", err)
-	}
-
-	// Wait up to 200ms for the session to be created
-	var sessionCreated bool
-	for i := 0; i < 10; i++ {
-		time.Sleep(20 * time.Millisecond)
-
-		socket.mu.Lock()
-		sessionCreated = len(socket.sessions) > 0
-		socket.mu.Unlock()
-
-		if sessionCreated {
-			break
-		}
+	// Dial the RUDP server socket
+	_, err = client.Dial(server.conn.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("failed to Dial server: %v", err)
 	}
 
-	if !sessionCreated {
-		t.Error("expected session to be created after sending SYN")
+	// Wait up to 200ms for the session to be created on the server side
+	select {
+	case <-time.After(time.Millisecond * 200):
+		t.Error("expected session to be created after dialing server")
+	case <-createdCh:
+		// Success
 	}
 }
 
-func TestHandleDataTriggersReceiveEvent(t *testing.T) {
-	recv := make(chan Event, 2)
-	socket, err := NewSocket("127.0.0.1:0", func(evt Event) {
-		if evt.Type == EventDataReceived {
-			recv <- evt
+func TestHandleEventDataReceived(t *testing.T) {
+	dataCh := make(chan Event, 1)
+
+	// Start a RUDP server socket
+	server, err := NewSocket("127.0.0.1:0", func(evt Event) {
+		if evt.Type == EventDataReceived && len(evt.Data) > 0 {
+			dataCh <- evt
 		}
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer socket.Close()
+	defer server.Close()
 
-	// Dial the socket
-	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: socket.conn.LocalAddr().(*net.UDPAddr).Port}
-	conn, err := net.DialUDP("udp", nil, addr)
+	// Start a RUDP client socket
+	client, err := NewSocket("127.0.0.1:0", nil)
 	if err != nil {
-		t.Fatalf("failed to dial socket: %v", err)
+		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer client.Close()
 
-	// Send SYN to initiate session
-	if _, err := conn.Write(buildPacket(1, 0x02, nil)); err != nil {
-		t.Fatalf("failed to send SYN: %v", err)
-	}
-
-	// Wait for session to be created
-	var sessionCreated bool
-	for i := 0; i < 10; i++ {
-		time.Sleep(20 * time.Millisecond)
-		socket.mu.Lock()
-		sessionCreated = len(socket.sessions) > 0
-		socket.mu.Unlock()
-		if sessionCreated {
-			break
-		}
-	}
-	if !sessionCreated {
-		t.Fatal("session was not created after sending SYN")
+	// Dial the server to establish a session
+	session, err := client.Dial(server.conn.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("failed to dial server: %v", err)
 	}
 
-	// Send data packet after session is confirmed
-	if _, err := conn.Write(buildPacket(2, 0x00, []byte("Hello!"))); err != nil {
+	// Send data using the RUDP session
+	payload := []byte("Hello!")
+	if err := client.Send(session, payload); err != nil {
 		t.Fatalf("failed to send data: %v", err)
 	}
 
-	// Loop: filter out any empty-payload events (from SYN)
-	timeout := time.After(500 * time.Millisecond)
-	for {
-		select {
-		case evt := <-recv:
-			if string(evt.Data) == "Hello!" {
-				// Success
-				return
-			}
-			// Log and continue
-			t.Logf("skipped event with unexpected payload: %q", evt.Data)
-		case <-timeout:
-			t.Fatal("timed out waiting for valid data event")
+	// Expect the server to receive the data within a timeout
+	select {
+	case evt := <-dataCh:
+		if string(evt.Data) != "Hello!" {
+			t.Errorf("unexpected data: got %q, want %q", evt.Data, "Hello!")
 		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected data event but timed out")
 	}
 }
 
@@ -205,24 +169,12 @@ func TestSendAPISendsData(t *testing.T) {
 	}
 	defer sender.Close()
 
+	// Create receiver session on the RUDP socket
 	receiverAddr := receiver.conn.LocalAddr().(*net.UDPAddr)
-
-	// --- Send SYN to receiver to create a session
-	sess := &Session{
-		PeerAddr:   receiverAddr,
-		Timeouts:   make(map[uint32]*time.Timer),
-		LastActive: time.Now(),
-		LastSeqNum: 1,
+	sess, err := sender.Dial(receiverAddr.String())
+	if err != nil {
+		t.Fatal(err)
 	}
-	sender.mu.Lock()
-	sender.sessions[receiverAddr.String()] = sess
-	sender.mu.Unlock()
-
-	synPkt := &Packet{
-		SeqNum: 1,
-		SYN:    true,
-	}
-	sender.sendPacket(sess, synPkt)
 
 	// Wait for receiver to ACK
 	time.Sleep(50 * time.Millisecond)
