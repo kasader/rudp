@@ -90,6 +90,7 @@ func TestHandleEventDataReceived(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to dial server: %v", err)
 	}
+	time.Sleep(20 * time.Millisecond)
 
 	// Send data using the RUDP session
 	payload := []byte("Hello!")
@@ -142,6 +143,7 @@ func TestRetransmissionTriggersTimeout(t *testing.T) {
 
 	// Send data — server will not ACK it, triggering retries
 	sendACKs = false
+	defer func() { sendACKs = true }()
 	client.Send(session, []byte("SOME_DATA"))
 
 	// Expect a timeout event from the client
@@ -155,9 +157,10 @@ func TestRetransmissionTriggersTimeout(t *testing.T) {
 
 func TestSendAPISendsData(t *testing.T) {
 	recv := make(chan Event, 1)
+	var payload = []byte("TEST_PAYLOAD")
 
-	// Create receiver RUDP socket
-	receiver, err := NewSocket("127.0.0.1:0", func(evt Event) {
+	// Start server
+	server, err := NewSocket("127.0.0.1:0", func(evt Event) {
 		if evt.Type == EventDataReceived {
 			recv <- evt
 		}
@@ -165,62 +168,24 @@ func TestSendAPISendsData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer receiver.Close()
+	defer server.Close()
 
-	// Create sender RUDP socket
-	sender, err := NewSocket("127.0.0.1:0", func(evt Event) {})
+	// Start client
+	client, err := NewSocket("127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sender.Close()
+	defer client.Close()
 
-	// Create receiver session on the RUDP socket
-	receiverAddr := receiver.conn.LocalAddr().(*net.UDPAddr)
-	sess, err := sender.Dial(receiverAddr.String())
+	// Dial the server
+	session, err := client.Dial(server.conn.LocalAddr().String())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("failed to dial server: %v", err)
 	}
 
-	// Wait for receiver to ACK
-	time.Sleep(50 * time.Millisecond)
-	ack := &Packet{
-		SeqNum: 2,
-		ACK:    true,
-	}
-	sender.handlePacket(receiverAddr, serializePacket(ack))
+	client.Send(session, payload)
 
-	// Wait for the receiver to ACK and create session
-	var recvSess *Session
-	for i := 0; i < 10; i++ {
-		time.Sleep(50 * time.Millisecond)
-		receiver.mu.Lock()
-		for _, s := range receiver.sessions {
-			recvSess = s
-			break
-		}
-		receiver.mu.Unlock()
-		if recvSess != nil {
-			break
-		}
-	}
-	if recvSess == nil {
-		t.Fatal("receiver session not established")
-	}
-
-	// --- Manually ACK the SYN back to sender to simulate full handshake
-	ack = &Packet{
-		SeqNum: 2,
-		ACK:    true,
-	}
-	sender.handlePacket(receiverAddr, serializePacket(ack))
-
-	// --- Send application data
-	payload := []byte("ping from sender")
-	if err := sender.Send(sess, payload); err != nil {
-		t.Fatalf("Send failed: %v", err)
-	}
-
-	// --- Wait for receiver to receive data
+	// Wait for server to receive client payload
 	select {
 	case evt := <-recv:
 		if string(evt.Data) != string(payload) {
