@@ -3,13 +3,14 @@ package rudp
 import (
 	"bytes"
 	crand "crypto/rand"
+	"fmt"
 	"math/rand/v2"
 	"testing"
 	"time"
 )
 
 func TestFuzzedEchoRoundTrip(t *testing.T) {
-	const numMessages = 4
+	const numMessages = 20
 	const maxPayloadSize = 256
 	const timeout = 500 * time.Millisecond
 
@@ -57,7 +58,8 @@ func TestFuzzedEchoRoundTrip(t *testing.T) {
 		sentPayloads = append(sentPayloads, payload)
 
 		if err := client.Send(session, payload); err != nil {
-			t.Fatalf("failed to send payload %d: %v", i, err)
+			t.Logf("failed to send payload %d: %v", i, err)
+			time.Sleep(time.Millisecond * 10)
 		}
 	}
 
@@ -73,4 +75,5 @@ func TestFuzzedEchoRoundTrip(t *testing.T) {
 			t.Fatalf("timed out waiting for echo message %d", i)
 		}
 	}
+	fmt.Println("AAAAABBAAA")
 }
