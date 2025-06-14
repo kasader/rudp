@@ -136,7 +136,11 @@ func (s *Socket) sendLoop(sess *Session) {
 			// now := time.Now()
 			var remaining []*Packet
 			for _, pkt := range sess.SendWindow {
-				fmt.Printf("Sending: %s\n", pkt)
+				if pkt.SeqNum < sess.AckedUntil {
+					fmt.Printf("%s: Pruning packet %d, AckedUntil=%d\n", s.conn.LocalAddr().String(), pkt.SeqNum, sess.AckedUntil)
+					continue // drop it!
+				}
+				fmt.Printf("%s: Sending: %s\n", s.conn.LocalAddr().String(), pkt)
 				if pkt.Retrans >= RUDP_MAX_RETRANS {
 					s.eventHandler(Event{
 						Type:    EventTimeout,
@@ -166,14 +170,7 @@ func (s *Socket) Dial(addr string) (*Session, error) {
 		return nil, err
 	}
 
-	sess := &Session{
-		PeerAddr:     udpAddr,
-		Timeouts:     make(map[uint32]*time.Timer),
-		LastActive:   time.Now(),
-		RecvBuffer:   make(map[uint32]*Packet),
-		ExpectedSeq:  1,
-		sendLoopQuit: make(chan struct{}),
-	}
+	sess := newSession(udpAddr)
 
 	s.mu.Lock()
 	s.sessions[udpAddr.String()] = sess
@@ -183,6 +180,18 @@ func (s *Socket) Dial(addr string) (*Session, error) {
 	go s.sendLoop(sess)
 
 	return sess, nil
+}
+
+func newSession(addr *net.UDPAddr) *Session {
+	return &Session{
+		PeerAddr:     addr,
+		Timeouts:     make(map[uint32]*time.Timer),
+		SendWindow:   make([]*Packet, 0), // FIXME: am I pointless?
+		LastActive:   time.Now(),
+		RecvBuffer:   make(map[uint32]*Packet),
+		ExpectedSeq:  1,
+		sendLoopQuit: make(chan struct{}),
+	}
 }
 
 // SendTo sends data to the given remote address, establishing a session if needed.
@@ -197,13 +206,7 @@ func (s *Socket) SendTo(addr string, data []byte) error {
 	s.mu.Lock()
 	sess, exists := s.sessions[key]
 	if !exists {
-		sess = &Session{
-			PeerAddr:    udpAddr,
-			Timeouts:    make(map[uint32]*time.Timer),
-			LastActive:  time.Now(),
-			RecvBuffer:  make(map[uint32]*Packet),
-			ExpectedSeq: 1,
-		}
+		sess = newSession(udpAddr)
 		s.sessions[key] = sess
 		s.mu.Unlock()
 
@@ -250,9 +253,13 @@ func (s *Socket) handlePacket(addr *net.UDPAddr, data []byte) {
 	if err != nil {
 		return
 	}
-	fmt.Printf("Received: %s from %s\n", packet, addr)
 
 	sessionKey := addr.String()
+	var sess *Session
+	var isNewSession bool
+
+	var eventsToFire []Event
+
 	s.mu.Lock()
 	sess, exists := s.sessions[sessionKey]
 	if !exists {
@@ -260,62 +267,43 @@ func (s *Socket) handlePacket(addr *net.UDPAddr, data []byte) {
 			s.mu.Unlock()
 			return
 		}
-		sess = &Session{
-			PeerAddr:     addr,
-			LastActive:   time.Now(),
-			ExpectedSeq:  packet.SeqNum + 1,
-			RecvBuffer:   make(map[uint32]*Packet),
-			sendLoopQuit: make(chan struct{}),
-		}
+		isNewSession = true
+		sess = newSession(addr)
+		sess.ExpectedSeq = packet.SeqNum + 1 // Server expects the next packet after the SYN.
 		s.sessions[sessionKey] = sess
-		s.eventHandler(Event{Type: EventCreate, Session: sess})
-		go s.sendLoop(sess)
 	}
 	s.mu.Unlock()
 
+	if isNewSession {
+		eventsToFire = append(eventsToFire, Event{Type: EventCreate, Session: sess})
+		go s.sendLoop(sess)
+	}
+
 	sess.mu.Lock()
-	defer sess.mu.Unlock()
 	sess.LastActive = time.Now()
+	fmt.Printf("%s: ExpectedSeq=%d, received packet Seq=%d\n", s.conn.LocalAddr().String(), sess.ExpectedSeq, packet.SeqNum)
 
 	if packet.ACK {
-		// Remove acknowledged packets from the send window
-		var newWindow []*Packet
-		for _, pkt := range sess.SendWindow {
-			if pkt.SeqNum >= packet.SeqNum {
-				newWindow = append(newWindow, pkt)
-			}
+		fmt.Printf("Received ACK for SeqNum=%d on %s\n", packet.SeqNum, s.conn.LocalAddr().String())
+		if packet.SeqNum > sess.AckedUntil {
+			sess.AckedUntil = packet.SeqNum
 		}
-		sess.SendWindow = newWindow
-		return
-	}
-
-	if packet.FIN {
-		sess.Closed = true
-		close(sess.sendLoopQuit)
-		s.eventHandler(Event{Type: EventClose, Session: sess})
-		return
-	}
-
-	if packet.SYN {
+	} else if packet.FIN {
+		if !sess.Closed {
+			sess.Closed = true
+			close(sess.sendLoopQuit)
+			eventsToFire = append(eventsToFire, Event{Type: EventClose, Session: sess})
+		}
+	} else if packet.SYN {
 		ack := &Packet{SeqNum: packet.SeqNum + 1, ACK: true}
 		s.sendRaw(sess, ack)
-	}
-
-	if !sendACKs {
-		return
-	}
-
-	if len(packet.Data) > 0 {
+	} else if sendACKs && len(packet.Data) > 0 {
 		if packet.SeqNum < sess.ExpectedSeq {
-			if sendACKs {
-				s.sendRaw(sess, &Packet{SeqNum: sess.ExpectedSeq, ACK: true})
-			}
-			return
+			// This is a duplicated packet, just re-send the ACK for what we expect.
+			s.sendRaw(sess, &Packet{SeqNum: sess.ExpectedSeq, ACK: true})
 		} else if packet.SeqNum == sess.ExpectedSeq {
-			payload := make([]byte, len(packet.Data))
-			copy(payload, packet.Data)
-			s.sendRaw(sess, &Packet{SeqNum: packet.SeqNum + 1, ACK: true})
-			s.eventHandler(Event{Type: EventDataReceived, Session: sess, Data: payload})
+			// We received the expected packet. Process it and any subsequent packets in the buffer.
+			packetsToProcess := []*Packet{packet}
 			sess.ExpectedSeq++
 
 			for {
@@ -323,16 +311,28 @@ func (s *Socket) handlePacket(addr *net.UDPAddr, data []byte) {
 				if !ok {
 					break
 				}
+				packetsToProcess = append(packetsToProcess, nextPkt)
 				delete(sess.RecvBuffer, sess.ExpectedSeq)
-				payload := make([]byte, len(nextPkt.Data))
-				copy(payload, nextPkt.Data)
-				s.sendRaw(sess, &Packet{SeqNum: nextPkt.SeqNum + 1, ACK: true})
-				s.eventHandler(Event{Type: EventDataReceived, Session: sess, Data: payload})
 				sess.ExpectedSeq++
 			}
-		} else {
+
+			for _, p := range packetsToProcess {
+				s.sendRaw(sess, &Packet{SeqNum: p.SeqNum + 1, ACK: true})
+				payload := make([]byte, len(p.Data))
+				copy(payload, p.Data)
+				eventsToFire = append(eventsToFire, Event{Type: EventDataReceived, Session: sess, Data: payload})
+			}
+		} else { // packet.SeqNum > sess.ExpectedSeq
+			// This is a future packet, buffer it.
 			sess.RecvBuffer[packet.SeqNum] = packet
 		}
+	}
+
+	sess.mu.Unlock()
+
+	// Fire all buffered events after releasing the session lock.
+	for _, event := range eventsToFire {
+		s.eventHandler(event)
 	}
 }
 
