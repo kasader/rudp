@@ -64,6 +64,7 @@ type Session struct {
 
 	// fields for send-side windowing
 	LastSeqNum uint32    // Last used sequence number.
+	nextFragID uint16    // Per-session counter for fragment IDs.
 	SendWindow []*Packet // In-flight, unacknowledged packets.
 	AckedUntil uint32    // Last acknowledged sequence number.
 	LastActive time.Time
@@ -82,6 +83,7 @@ func newSession(addr *net.UDPAddr) *Session {
 		ReassemblyBuffer: make(map[uint16][]*Packet),
 		SendWindow:       make([]*Packet, 0),
 		ExpectedSeq:      1,
+		nextFragID:       0,
 		established:      make(chan struct{}),
 		closed:           make(chan struct{}),
 	}
@@ -136,11 +138,8 @@ func (s *Socket) Send(sess *Session, data []byte) error {
 	}
 
 	if len(data) > payloadMTU {
-		// --- Fragmentation Logic ---
-		fragIDMutex.Lock()
-		fragID := nextFragID
-		nextFragID++
-		fragIDMutex.Unlock()
+		fragID := sess.nextFragID
+		sess.nextFragID++
 
 		totalFrags := uint16(len(data) / payloadMTU)
 		if len(data)%payloadMTU != 0 {
