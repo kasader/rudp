@@ -111,7 +111,15 @@ func TestHandleEventDataReceived(t *testing.T) {
 func TestRetransmissionTriggersTimeout(t *testing.T) {
 	timeoutFired := make(chan struct{}, 1)
 
-	socket, err := NewSocket("127.0.0.1:0", func(evt Event) {
+	// Start server that does NOT respond to packets
+	server, err := NewSocket("127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	// Start client
+	client, err := NewSocket("127.0.0.1:0", func(evt Event) {
 		if evt.Type == EventTimeout {
 			timeoutFired <- struct{}{}
 		}
@@ -119,32 +127,29 @@ func TestRetransmissionTriggersTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer socket.Close()
+	defer client.Close()
 
-	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 50000}
-	sess := &Session{
-		PeerAddr: addr,
-		Timeouts: make(map[uint32]*time.Timer),
+	// Dial server — this creates a session that the server will ignore
+	session, err := client.Dial(server.conn.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("failed to dial server: %v", err)
 	}
-	socket.mu.Lock()
-	socket.sessions[addr.String()] = sess
-	socket.mu.Unlock()
 
-	// Force retransmission immediately for test
-	oldTimeout := RUDP_TIMEOUT
+	// Reduce timeout to make test complete quickly
+	originalTimeout := RUDP_TIMEOUT
 	RUDP_TIMEOUT = 10 * time.Millisecond
-	defer func() { RUDP_TIMEOUT = oldTimeout }()
+	defer func() { RUDP_TIMEOUT = originalTimeout }()
 
-	socket.sendPacket(sess, &Packet{
-		SeqNum:  1,
-		Data:    []byte("test"),
-		Retrans: RUDP_MAX_RETRANS,
-	})
+	// Send data — server will not ACK it, triggering retries
+	sendACKs = false
+	client.Send(session, []byte("SOME_DATA"))
 
+	// Expect a timeout event from the client
 	select {
 	case <-timeoutFired:
-	case <-time.After(200 * time.Millisecond):
-		t.Error("expected timeout event")
+		// Success
+	case <-time.After(500 * time.Millisecond):
+		t.Error("expected timeout event but none occurred")
 	}
 }
 

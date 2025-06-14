@@ -1,8 +1,8 @@
 package rudp
 
 import (
-	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -16,6 +16,8 @@ var (
 	// RUDP_MAX_RETRANS is the max number of retransmission attempts before giving up.
 	RUDP_MAX_RETRANS = 5
 )
+
+var sendACKs = true
 
 const (
 	EventDataReceived = "RUDP_EVENT_DATA"
@@ -46,15 +48,6 @@ type Address struct {
 	Port int
 }
 
-type Packet struct {
-	SeqNum  uint32 // Packet sequence number.
-	ACK     bool   // ACK flag (packet acknowledged).
-	SYN     bool   // SYN flag (connection open).
-	FIN     bool   // FIN flag (connection close).
-	Data    []byte // Application payload.
-	Retrans int    // Number of retransmissions so far.
-}
-
 type Session struct {
 	PeerAddr   *net.UDPAddr           // Remote address.
 	LastSeqNum uint32                 // Last used sequence number.
@@ -67,8 +60,9 @@ type Session struct {
 	mu         sync.Mutex
 
 	// fields for receive-side windowing
-	ExpectedSeq uint32             // next expected sequence number
-	RecvBuffer  map[uint32]*Packet // Buffer for out-of-order packets.
+	ExpectedSeq  uint32             // next expected sequence number
+	RecvBuffer   map[uint32]*Packet // Buffer for out-of-order packets.
+	sendLoopQuit chan struct{}
 }
 
 // Socket manages UDP transport, session demultiplexing, and event delivery.
@@ -111,26 +105,59 @@ func (s *Socket) Send(sess *Session, data []byte) error {
 		return errors.New("cannot send: session closed")
 	}
 
-	// Compute next sequence number
-	var nextSeq uint32
-	if len(sess.SendWindow) > 0 {
-		lastPkt := sess.SendWindow[len(sess.SendWindow)-1]
-		nextSeq = lastPkt.SeqNum + 1
-	} else {
-		nextSeq = sess.LastSeqNum + 1
-	}
+	nextSeq := sess.LastSeqNum + 1
 	sess.LastSeqNum = nextSeq
 
 	// Create packet
 	pkt := &Packet{
-		SeqNum:  nextSeq,
-		Data:    data,
-		Retrans: 0,
+		SeqNum: nextSeq,
+		Data:   data,
 	}
 
-	// Send the packet (will handle retries and window updates)
-	s.sendPacket(sess, pkt)
+	sess.SendWindow = append(sess.SendWindow, pkt)
 	return nil
+}
+
+func (s *Socket) sendLoop(sess *Session) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sess.sendLoopQuit:
+			return
+		case <-ticker.C:
+			fmt.Printf("I am TICK\n")
+			sess.mu.Lock()
+			if sess.Closed {
+				sess.mu.Unlock()
+				return
+			}
+			// now := time.Now()
+			var remaining []*Packet
+			for _, pkt := range sess.SendWindow {
+				fmt.Printf("Sending: %s\n", pkt)
+				if pkt.Retrans >= RUDP_MAX_RETRANS {
+					s.eventHandler(Event{
+						Type:    EventTimeout,
+						Session: sess,
+						Data:    pkt.Data,
+					})
+					continue
+				}
+				s.sendRaw(sess, pkt)
+				pkt.Retrans++
+				remaining = append(remaining, pkt)
+			}
+			sess.SendWindow = remaining
+			sess.mu.Unlock()
+		}
+	}
+}
+
+func (s *Socket) sendRaw(sess *Session, pkt *Packet) {
+	buf := serializePacket(pkt)
+	s.conn.WriteToUDP(buf, sess.PeerAddr)
 }
 
 func (s *Socket) Dial(addr string) (*Session, error) {
@@ -140,11 +167,12 @@ func (s *Socket) Dial(addr string) (*Session, error) {
 	}
 
 	sess := &Session{
-		PeerAddr:    udpAddr,
-		Timeouts:    make(map[uint32]*time.Timer),
-		LastActive:  time.Now(),
-		RecvBuffer:  make(map[uint32]*Packet),
-		ExpectedSeq: 1,
+		PeerAddr:     udpAddr,
+		Timeouts:     make(map[uint32]*time.Timer),
+		LastActive:   time.Now(),
+		RecvBuffer:   make(map[uint32]*Packet),
+		ExpectedSeq:  1,
+		sendLoopQuit: make(chan struct{}),
 	}
 
 	s.mu.Lock()
@@ -152,6 +180,7 @@ func (s *Socket) Dial(addr string) (*Session, error) {
 	s.mu.Unlock()
 
 	s.sendSYN(sess)
+	go s.sendLoop(sess)
 
 	return sess, nil
 }
@@ -201,7 +230,7 @@ func (s *Socket) sendSYN(sess *Session) error {
 	}
 	// reset our last sequence number back to 1
 	sess.LastSeqNum = 1
-	s.sendPacket(sess, syn)
+	sess.SendWindow = append(sess.SendWindow, syn)
 	return nil
 }
 
@@ -221,6 +250,7 @@ func (s *Socket) handlePacket(addr *net.UDPAddr, data []byte) {
 	if err != nil {
 		return
 	}
+	fmt.Printf("Received: %s from %s\n", packet, addr)
 
 	sessionKey := addr.String()
 	s.mu.Lock()
@@ -231,14 +261,15 @@ func (s *Socket) handlePacket(addr *net.UDPAddr, data []byte) {
 			return
 		}
 		sess = &Session{
-			PeerAddr:    addr,
-			Timeouts:    make(map[uint32]*time.Timer),
-			LastActive:  time.Now(),
-			ExpectedSeq: packet.SeqNum + 1,
-			RecvBuffer:  make(map[uint32]*Packet),
+			PeerAddr:     addr,
+			LastActive:   time.Now(),
+			ExpectedSeq:  packet.SeqNum + 1,
+			RecvBuffer:   make(map[uint32]*Packet),
+			sendLoopQuit: make(chan struct{}),
 		}
 		s.sessions[sessionKey] = sess
 		s.eventHandler(Event{Type: EventCreate, Session: sess})
+		go s.sendLoop(sess)
 	}
 	s.mu.Unlock()
 
@@ -246,69 +277,62 @@ func (s *Socket) handlePacket(addr *net.UDPAddr, data []byte) {
 	defer sess.mu.Unlock()
 	sess.LastActive = time.Now()
 
-	// Handle ACK
 	if packet.ACK {
-		if timer, ok := sess.Timeouts[packet.SeqNum-1]; ok {
-			timer.Stop()
-			delete(sess.Timeouts, packet.SeqNum-1)
+		// Remove acknowledged packets from the send window
+		var newWindow []*Packet
+		for _, pkt := range sess.SendWindow {
+			if pkt.SeqNum >= packet.SeqNum {
+				newWindow = append(newWindow, pkt)
+			}
 		}
-		for len(sess.SendWindow) > 0 && sess.SendWindow[0].SeqNum < packet.SeqNum {
-			sess.SendWindow = sess.SendWindow[1:]
-		}
+		sess.SendWindow = newWindow
 		return
 	}
 
 	if packet.FIN {
-		s.sendPacket(sess, ackPacket(packet.SeqNum+1))
 		sess.Closed = true
+		close(sess.sendLoopQuit)
 		s.eventHandler(Event{Type: EventClose, Session: sess})
 		return
 	}
 
 	if packet.SYN {
-		s.sendPacket(sess, ackPacket(packet.SeqNum+1))
+		ack := &Packet{SeqNum: packet.SeqNum + 1, ACK: true}
+		s.sendRaw(sess, ack)
+	}
+
+	if !sendACKs {
+		return
 	}
 
 	if len(packet.Data) > 0 {
-		// Out-of-order buffer logic
 		if packet.SeqNum < sess.ExpectedSeq {
-			// Duplicate packet, ACK again
-			s.sendPacket(sess, ackPacket(sess.ExpectedSeq))
+			if sendACKs {
+				s.sendRaw(sess, &Packet{SeqNum: sess.ExpectedSeq, ACK: true})
+			}
 			return
 		} else if packet.SeqNum == sess.ExpectedSeq {
-			// Deliver and slide window
-			s.deliverInOrder(sess, packet)
+			payload := make([]byte, len(packet.Data))
+			copy(payload, packet.Data)
+			s.sendRaw(sess, &Packet{SeqNum: packet.SeqNum + 1, ACK: true})
+			s.eventHandler(Event{Type: EventDataReceived, Session: sess, Data: payload})
+			sess.ExpectedSeq++
+
+			for {
+				nextPkt, ok := sess.RecvBuffer[sess.ExpectedSeq]
+				if !ok {
+					break
+				}
+				delete(sess.RecvBuffer, sess.ExpectedSeq)
+				payload := make([]byte, len(nextPkt.Data))
+				copy(payload, nextPkt.Data)
+				s.sendRaw(sess, &Packet{SeqNum: nextPkt.SeqNum + 1, ACK: true})
+				s.eventHandler(Event{Type: EventDataReceived, Session: sess, Data: payload})
+				sess.ExpectedSeq++
+			}
 		} else {
-			// Buffer out-of-order packet
 			sess.RecvBuffer[packet.SeqNum] = packet
 		}
-	}
-}
-
-func parsePacket(data []byte) (*Packet, error) {
-	if len(data) < 5 {
-		return nil, ErrMalformedPacket
-	}
-
-	seqNum := binary.BigEndian.Uint32(data[0:4])
-	flags := data[4]
-
-	payload := make([]byte, len(data[5:]))
-	copy(payload, data[5:])
-
-	return &Packet{
-		SeqNum: seqNum,
-		ACK:    flags&0x01 != 0,
-		SYN:    flags&0x02 != 0,
-		FIN:    flags&0x04 != 0,
-		Data:   payload,
-	}, nil
-}
-
-func ackPacket(seq uint32) *Packet {
-	return &Packet{
-		SeqNum: seq,
-		ACK:    true,
 	}
 }
 
@@ -319,88 +343,29 @@ func (s *Socket) Close() {
 	defer s.mu.Unlock()
 	for _, sess := range s.sessions {
 		sess.Closed = true
+		sess.sendLoopQuit <- struct{}{} // close the send loop
 		s.eventHandler(Event{Type: EventClose, Session: sess})
 	}
 }
 
-func (s *Socket) sendPacket(sess *Session, pkt *Packet) {
-	buf := serializePacket(pkt)
+// func (s *Socket) deliverInOrder(sess *Session, pkt *Packet) {
+// 	for {
+// 		payload := make([]byte, len(pkt.Data))
+// 		copy(payload, pkt.Data)
+// 		if sendACKs { // for testing purposes
+// 			s.sendPacket(sess, ackPacket(pkt.SeqNum+1))
+// 		}
+// 		s.eventHandler(Event{Type: EventDataReceived, Session: sess, Data: payload})
 
-	// Send the packet over UDP
-	_, err := s.conn.WriteToUDP(buf, sess.PeerAddr)
-	if err != nil {
-		// Logging or retry logic could go here
-		return
-	}
+// 		sess.ExpectedSeq = pkt.SeqNum + 1
 
-	// Track in SendWindow if not an ACK
-	if !pkt.ACK {
-		sess.SendWindow = append(sess.SendWindow, pkt)
-
-		if pkt.Retrans >= RUDP_MAX_RETRANS {
-			// Give up and signal timeout
-			s.eventHandler(Event{
-				Type:    EventTimeout,
-				Session: sess,
-				Data:    pkt.Data,
-			})
-			return
-		}
-
-		// Schedule retransmission
-		seq := pkt.SeqNum
-		timer := time.AfterFunc(RUDP_TIMEOUT, func() {
-			sess.mu.Lock()
-			defer sess.mu.Unlock()
-
-			// If already ACKed, skip
-			if _, ok := sess.Timeouts[seq]; !ok {
-				return
-			}
-
-			pkt.Retrans++
-			delete(sess.Timeouts, seq)
-			s.sendPacket(sess, pkt) // Recursive retry
-		})
-		sess.Timeouts[seq] = timer
-	}
-}
-
-func serializePacket(pkt *Packet) []byte {
-	flags := byte(0)
-	if pkt.ACK {
-		flags |= 0x01
-	}
-	if pkt.SYN {
-		flags |= 0x02
-	}
-	if pkt.FIN {
-		flags |= 0x04
-	}
-
-	buf := make([]byte, 4+1+len(pkt.Data))
-	binary.BigEndian.PutUint32(buf[0:4], pkt.SeqNum)
-	buf[4] = flags
-	copy(buf[5:], pkt.Data)
-	return buf
-}
-
-func (s *Socket) deliverInOrder(sess *Session, pkt *Packet) {
-	for {
-		payload := make([]byte, len(pkt.Data))
-		copy(payload, pkt.Data)
-		s.sendPacket(sess, ackPacket(pkt.SeqNum+1))
-		s.eventHandler(Event{Type: EventDataReceived, Session: sess, Data: payload})
-
-		sess.ExpectedSeq = pkt.SeqNum + 1
-
-		// Look ahead before looping.
-		nextPkt, ok := sess.RecvBuffer[sess.ExpectedSeq]
-		if !ok {
-			break
-		}
-		// Remove before proceeding to avoid reuse or overwrite.
-		delete(sess.RecvBuffer, sess.ExpectedSeq)
-		pkt = nextPkt
-	}
-}
+// 		// Look ahead before looping.
+// 		nextPkt, ok := sess.RecvBuffer[sess.ExpectedSeq]
+// 		if !ok {
+// 			break
+// 		}
+// 		// Remove before proceeding to avoid reuse or overwrite.
+// 		delete(sess.RecvBuffer, sess.ExpectedSeq)
+// 		pkt = nextPkt
+// 	}
+// }
