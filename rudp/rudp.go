@@ -93,6 +93,9 @@ type Socket struct {
 	sessions     map[string]*Session
 	eventHandler EventHandler
 	mu           sync.Mutex
+	// testPacketSendHook is a hook for testing to simulate packet loss.
+	// If it returns false, the packet is not sent.
+	testPacketSendHook func(pkt *Packet) bool
 }
 
 // NewSocket initializes and binds a RUDP socket to addr with an event callback.
@@ -216,6 +219,13 @@ func (s *Socket) sendLoop(sess *Session) {
 }
 
 func (s *Socket) sendRaw(sess *Session, pkt *Packet) {
+	// Check test hook before sending
+	if s.testPacketSendHook != nil {
+		if !s.testPacketSendHook(pkt) {
+			// Packet dropped by test hook.
+			return
+		}
+	}
 	buf := serializePacket(pkt)
 	s.conn.WriteToUDP(buf, sess.PeerAddr)
 }
@@ -360,7 +370,10 @@ func (s *Session) handleData(packet *Packet, sock *Socket) []Event {
 		// Future packet, buffer it.
 		s.RecvBuffer[packet.SeqNum] = packet
 		if sendACKs {
-			sock.sendRaw(s, &Packet{SeqNum: packet.SeqNum + 1, ACK: true})
+			// Send a cumulative ACK for what we have received so far,
+			// not an ACK for the future packet. This signals to the sender
+			// that we are still waiting for s.ExpectedSeq.
+			sock.sendRaw(s, &Packet{SeqNum: s.ExpectedSeq, ACK: true})
 		}
 		return nil
 	}
