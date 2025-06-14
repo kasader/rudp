@@ -130,16 +130,16 @@ func TestRetransmissionTriggersTimeout(t *testing.T) {
 	}
 	defer client.Close()
 
+	// Reduce timeout to make test complete quickly
+	originalTimeout := RUDP_TIMEOUT
+	RUDP_TIMEOUT = 10 * time.Millisecond
+	defer func() { RUDP_TIMEOUT = originalTimeout }()
+
 	// Dial server — this creates a session that the server will ignore
 	session, err := client.Dial(server.conn.LocalAddr().String())
 	if err != nil {
 		t.Fatalf("failed to dial server: %v", err)
 	}
-
-	// Reduce timeout to make test complete quickly
-	originalTimeout := RUDP_TIMEOUT
-	RUDP_TIMEOUT = 10 * time.Millisecond
-	defer func() { RUDP_TIMEOUT = originalTimeout }()
 
 	// Send data — server will not ACK it, triggering retries
 	sendACKs = false

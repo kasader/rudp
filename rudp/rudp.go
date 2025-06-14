@@ -14,9 +14,9 @@ var (
 	// RUDP_TIMEOUT is the timeout duration for packet retransmission.
 	RUDP_TIMEOUT = 500 * time.Millisecond
 	// RUDP_MAX_RETRANS is the max number of retransmission attempts before giving up.
-	RUDP_MAX_RETRANS        = 5
-	RUDP_RCV_BUFFER_SIZE    = 2048
-	RUDP_SEND_LOOP_INTERVAL = 50 // In milliseconds
+	RUDP_MAX_RETRANS = 5
+	// RUDP_RCV_BUFFER_SIZE is the size of the UDP receive buffer.
+	RUDP_RCV_BUFFER_SIZE = 2048
 )
 
 var sendACKs = true
@@ -44,7 +44,7 @@ type Event struct {
 // EventHandler is a callback for handling asynchronous events (e.g., incoming data, timeout).
 type EventHandler func(event Event)
 
-// Address represents an endpoint IP/port pair. TODO: (Currently unused in core logic—potential for extension).
+// Address represents an endpoint IP/port pair.
 type Address struct {
 	IP   net.IP
 	Port int
@@ -122,7 +122,6 @@ func (s *Socket) Send(sess *Session, data []byte) error {
 	nextSeq := sess.LastSeqNum + 1
 	sess.LastSeqNum = nextSeq
 
-	// Create packet
 	pkt := &Packet{
 		SeqNum: nextSeq,
 		Data:   data,
@@ -148,21 +147,29 @@ func (s *Socket) sendLoop(sess *Session) {
 				sess.mu.Unlock()
 				return
 			}
+
 			var remaining []*Packet
 			for _, pkt := range sess.SendWindow {
+				// Prune acknowledged packets
 				if pkt.SeqNum < sess.AckedUntil {
-					continue // Prune acknowledged packet
+					continue
 				}
+
+				// Check for timeout
 				fmt.Printf("%s: Sending: %s\n", s.conn.LocalAddr().String(), pkt)
 				if pkt.Retrans >= RUDP_MAX_RETRANS {
 					s.eventHandler(Event{Type: EventTimeout, Session: sess, Data: pkt.Data})
-					continue // Drop packet
+					// Do not add to remaining, effectively dropping it.
+					continue
 				}
+
+				// Retransmit
 				s.sendRaw(sess, pkt)
 				pkt.Retrans++
 				remaining = append(remaining, pkt)
 			}
 			sess.SendWindow = remaining
+
 			sess.mu.Unlock()
 		}
 	}
@@ -183,20 +190,19 @@ func (s *Socket) Dial(addr string) (*Session, error) {
 	s.sessions[udpAddr.String()] = sess
 	s.mu.Unlock()
 
-	s.sendSYN(sess) // Place the SYN packet in the send window.
+	// Place SYN in window and start the retransmission loop
+	s.sendSYN(sess)
 	go s.sendLoop(sess)
 
+	// Wait for establishment or timeout
 	select {
 	case <-sess.established:
-		// Success! The sendLoop is already running.
 		return sess, nil
-	case <-time.After(RUDP_TIMEOUT):
-		// The dial timed out. We need to clean up the session and stop the sendLoop.
+	case <-time.After(time.Duration(RUDP_MAX_RETRANS+1) * RUDP_TIMEOUT):
 		sess.mu.Lock()
-		// Check state to prevent race conditions if it gets established right at the timeout wire.
 		if sess.state != Established {
 			sess.state = Closed
-			close(sess.closed) // Signal the sendLoop to stop.
+			close(sess.closed)
 		}
 		sess.mu.Unlock()
 
@@ -213,39 +219,11 @@ func newSession(addr *net.UDPAddr) *Session {
 		state:       Connecting,
 		LastActive:  time.Now(),
 		RecvBuffer:  make(map[uint32]*Packet),
-		SendWindow:  make([]*Packet, 0), // FIXME: am I pointless?
+		SendWindow:  make([]*Packet, 0),
 		ExpectedSeq: 1,
 		established: make(chan struct{}),
 		closed:      make(chan struct{}),
 	}
-}
-
-// SendTo sends data to the given remote address, establishing a session if needed.
-func (s *Socket) SendTo(addr string, data []byte) error {
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return err
-	}
-
-	key := udpAddr.String()
-
-	s.mu.Lock()
-	sess, exists := s.sessions[key]
-	if !exists {
-		sess = newSession(udpAddr)
-		s.sessions[key] = sess
-		s.mu.Unlock()
-
-		// Initiate handshake outside lock
-		s.sendSYN(sess)
-
-		// Optional: wait briefly for handshake (or ACK)
-		time.Sleep(20 * time.Millisecond)
-	} else {
-		s.mu.Unlock()
-	}
-
-	return s.Send(sess, data)
 }
 
 // sendSYN sends the initial SYN packet to begin a session.
@@ -254,12 +232,12 @@ func (s *Socket) sendSYN(sess *Session) {
 	defer sess.mu.Unlock()
 
 	syn := &Packet{
-		SeqNum:  1,
-		SYN:     true,
-		Retrans: 0,
+		SeqNum: 1,
+		SYN:    true,
 	}
 	sess.LastSeqNum = 1
 	sess.SendWindow = append(sess.SendWindow, syn)
+	s.sendRaw(sess, syn) // Send immediately
 }
 
 func (s *Socket) listen() {
@@ -267,22 +245,17 @@ func (s *Socket) listen() {
 	for {
 		n, addr, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
-			// conn.Close() was likely called.
 			return
 		}
-		// Make a copy of the data to avoid race conditions as buf is reused.
 		data := make([]byte, n)
 		copy(data, buf[:n])
 		go s.handlePacket(addr, data)
 	}
 }
 
-// handlePacket is the top-level dispatcher. It parses packets and routes them
-// to the correct session for handling.
 func (s *Socket) handlePacket(addr *net.UDPAddr, data []byte) {
 	packet, err := parsePacket(data)
 	if err != nil {
-		// Malformed packet, ignore.
 		return
 	}
 
@@ -290,13 +263,12 @@ func (s *Socket) handlePacket(addr *net.UDPAddr, data []byte) {
 	s.mu.Lock()
 	sess, exists := s.sessions[sessionKey]
 	if !exists {
-		// If a session doesn't exist, we only care about SYN packets.
 		if !packet.SYN {
 			s.mu.Unlock()
 			return
 		}
 		sess = newSession(addr)
-		sess.ExpectedSeq = packet.SeqNum + 1 // Server expects next sequence after SYN.
+		sess.ExpectedSeq = packet.SeqNum + 1
 		s.sessions[sessionKey] = sess
 		s.mu.Unlock()
 
@@ -306,17 +278,13 @@ func (s *Socket) handlePacket(addr *net.UDPAddr, data []byte) {
 		s.mu.Unlock()
 	}
 
-	// Delegate the actual packet handling to the session.
 	events := sess.handle(packet, s)
 
-	// Fire events after releasing all locks.
 	for _, event := range events {
 		s.eventHandler(event)
 	}
 }
 
-// handle is the session-level packet handler. It manages state transitions
-// and calls specific handlers based on packet type.
 func (s *Session) handle(packet *Packet, sock *Socket) []Event {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -325,14 +293,13 @@ func (s *Session) handle(packet *Packet, sock *Socket) []Event {
 	var eventsToFire []Event
 
 	if s.state == Closed {
-		return nil // Ignore packets for closed sessions.
+		return nil
 	}
 
 	if packet.ACK {
-		// This is a SYN-ACK from the server, completing the handshake.
 		if s.state == Connecting && packet.SYN {
 			s.state = Established
-			close(s.established) // Unblock Dial()
+			close(s.established)
 		}
 		if packet.SeqNum > s.AckedUntil {
 			s.AckedUntil = packet.SeqNum
@@ -340,11 +307,10 @@ func (s *Session) handle(packet *Packet, sock *Socket) []Event {
 	} else if packet.FIN {
 		if s.state != Closed {
 			s.state = Closed
-			close(s.closed) // Unblock sendLoop
+			close(s.closed)
 			eventsToFire = append(eventsToFire, Event{Type: EventClose, Session: s})
 		}
 	} else if packet.SYN {
-		// This is a SYN from a client. Server must respond with SYN-ACK.
 		ack := &Packet{SeqNum: packet.SeqNum + 1, ACK: true, SYN: true}
 		sock.sendRaw(s, ack)
 	} else if len(packet.Data) > 0 {
@@ -356,38 +322,31 @@ func (s *Session) handle(packet *Packet, sock *Socket) []Event {
 	return eventsToFire
 }
 
-// handleData manages the receive window, buffering out-of-order packets
-// and preparing in-order packets for delivery.
 func (s *Session) handleData(packet *Packet, sock *Socket) []Event {
-	if packet.SeqNum < s.ExpectedSeq {
-		// This is a duplicate packet. Acknowledge it again in case our last ACK was lost.
+	if packet.SeqNum < s.ExpectedSeq && sendACKs {
 		sock.sendRaw(s, &Packet{SeqNum: s.ExpectedSeq, ACK: true})
 		return nil
 	}
 
 	if packet.SeqNum > s.ExpectedSeq {
-		// This is a future packet. Buffer it for later processing.
 		s.RecvBuffer[packet.SeqNum] = packet
 		return nil
 	}
 
-	// This is the expected packet. Process it and any subsequent contiguous packets.
 	var eventsToFire []Event
 	packetsToProcess := []*Packet{packet}
 	s.ExpectedSeq++
 
-	// Check buffer for the next in-order packets.
 	for {
 		nextPkt, ok := s.RecvBuffer[s.ExpectedSeq]
 		if !ok {
-			break // No more contiguous packets.
+			break
 		}
 		packetsToProcess = append(packetsToProcess, nextPkt)
 		delete(s.RecvBuffer, s.ExpectedSeq)
 		s.ExpectedSeq++
 	}
 
-	// Fire events and send ACKs for the processed packets.
 	for _, p := range packetsToProcess {
 		if sendACKs {
 			sock.sendRaw(s, &Packet{SeqNum: p.SeqNum + 1, ACK: true})
@@ -399,7 +358,6 @@ func (s *Session) handleData(packet *Packet, sock *Socket) []Event {
 	return eventsToFire
 }
 
-// Close shuts down the socket and all active sessions.
 func (s *Socket) Close() {
 	s.conn.Close()
 	s.mu.Lock()
@@ -408,7 +366,7 @@ func (s *Socket) Close() {
 		sess.mu.Lock()
 		if sess.state != Closed {
 			sess.state = Closed
-			close(sess.closed) // Use close() for non-blocking broadcast.
+			close(sess.closed)
 			s.eventHandler(Event{Type: EventClose, Session: sess})
 		}
 		sess.mu.Unlock()
